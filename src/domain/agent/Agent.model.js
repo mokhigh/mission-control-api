@@ -11,7 +11,8 @@ const agentSchema = new mongoose.Schema(
     capabilities: { type: [String], default: [] },
     // null = global agent available to all projects
     projectId: { type: mongoose.Schema.Types.ObjectId, ref: 'Project', default: null },
-    model: { type: String, default: 'claude-opus-4-6' },
+    model: { type: String, default: 'claude-sonnet-4-6' },
+    effort: { type: String, enum: ['low', 'medium', 'high', 'max'], default: 'high' },
     systemPrompt: { type: String, default: '' },
     isActive: { type: Boolean, default: true },
   },

@@ -7,6 +7,7 @@ const executionSchema = new mongoose.Schema(
     taskId: { type: mongoose.Schema.Types.ObjectId, ref: 'Task', required: true },
     agentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Agent', required: true },
     status: { type: String, enum: STATUSES, default: 'queued' },
+    phase: { type: String, enum: ['orchestrate', 'implement'], default: 'orchestrate' },
     input: { type: mongoose.Schema.Types.Mixed, default: {} },
     output: { type: mongoose.Schema.Types.Mixed, default: null },
     startedAt: { type: Date, default: null },

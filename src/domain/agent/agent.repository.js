@@ -10,4 +10,5 @@ export const agentRepository = {
     return doc;
   },
   findOrchestrator: () => Agent.findOne({ type: 'orchestrator', isActive: true }).lean(),
+  findByName: (name) => Agent.findOne({ name, isActive: true }).lean(),
 };

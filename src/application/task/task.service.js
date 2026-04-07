@@ -41,7 +41,7 @@ export const taskService = {
  * Maps the trello-watcher payload to our Task schema.
  */
 export async function createTaskFromTrello(payload) {
-  const { cardId, cardName, description, listName, boardId, priority, projectId } = payload;
+  const { cardId, title: cardName, description, listName, boardId, priority, projectId } = payload;
 
   // Idempotency: skip if we already ingested this card
   const existing = await taskRepository.findByCardId(cardId);

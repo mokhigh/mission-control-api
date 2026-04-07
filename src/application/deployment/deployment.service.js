@@ -1,4 +1,5 @@
 import { deploymentRepository } from '../../domain/deployment/deployment.repository.js';
+import { taskRepository } from '../../domain/task/task.repository.js';
 import { NotFoundError, ValidationError } from '../../shared/errors/AppError.js';
 
 export const deploymentService = {
@@ -17,11 +18,16 @@ export const deploymentService = {
       throw new ValidationError(`Deployment is already ${deployment.status}`);
     }
 
-    return deploymentRepository.update(id, {
+    const updated = await deploymentRepository.update(id, {
       status: 'approved',
       approvedBy,
       approvedAt: new Date(),
     });
+
+    // Move the task to approved
+    await taskRepository.updateStatus(deployment.taskId, 'approved');
+
+    return updated;
   },
 
   async rejectDeployment(id, { rejectedBy, reason } = {}) {
@@ -31,11 +37,16 @@ export const deploymentService = {
       throw new ValidationError(`Deployment is already ${deployment.status}`);
     }
 
-    return deploymentRepository.update(id, {
+    const updated = await deploymentRepository.update(id, {
       status: 'rejected',
       approvedBy: rejectedBy || null,
       rejectedAt: new Date(),
       rejectionReason: reason || null,
     });
+
+    // Move the task back to failed
+    await taskRepository.updateStatus(deployment.taskId, 'failed');
+
+    return updated;
   },
 };
