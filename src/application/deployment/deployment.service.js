@@ -1,6 +1,7 @@
 import { deploymentRepository } from '../../domain/deployment/deployment.repository.js';
 import { taskRepository } from '../../domain/task/task.repository.js';
 import { NotFoundError, ValidationError } from '../../shared/errors/AppError.js';
+import { completeCard } from '../../infrastructure/trello/trello.client.js';
 
 export const deploymentService = {
   async listDeployments(filter = {}) {
@@ -25,7 +26,12 @@ export const deploymentService = {
     });
 
     // Move the task to approved
-    await taskRepository.updateStatus(deployment.taskId, 'approved');
+    const task = await taskRepository.updateStatus(deployment.taskId, 'approved');
+
+    // Move the Trello card to the finished list (non-blocking)
+    if (task?.source?.cardId && task?.source?.finishedListId) {
+      completeCard(task.source.cardId, task.source.finishedListId).catch(() => {});
+    }
 
     return updated;
   },

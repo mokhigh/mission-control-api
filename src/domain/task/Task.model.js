@@ -12,6 +12,7 @@ const taskSchema = new mongoose.Schema(
       cardId: String,
       cardUrl: String,
       listName: String,
+      finishedListId: String,
     },
     status: { type: String, enum: STATUSES, default: 'pending' },
     priority: { type: String, enum: ['low', 'medium', 'high', 'critical'], default: 'medium' },
