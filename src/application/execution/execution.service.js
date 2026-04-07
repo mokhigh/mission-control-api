@@ -21,6 +21,7 @@
  *      → direct API call to queue a specific agent on a task
  */
 import { spawn } from 'child_process';
+import { UnrecoverableError } from 'bullmq';
 import { executionRepository } from '../../domain/execution/execution.repository.js';
 import { agentRepository } from '../../domain/agent/agent.repository.js';
 import { logRepository } from '../../domain/log/log.repository.js';
@@ -32,6 +33,28 @@ import { sseHub } from '../../infrastructure/realtime/sse.js';
 import { commitAndPush, buildBranchName } from '../../infrastructure/git/branch.service.js';
 import { ensureCheckout } from '../../infrastructure/git/checkout.service.js';
 import { logger } from '../../infrastructure/logger.js';
+
+// ── Quota error detection ──────────────────────────────────────────────────
+
+const QUOTA_PATTERNS = [
+  /usage limit reached/i,
+  /rate limit/i,
+  /quota exceeded/i,
+  /too many requests/i,
+  /overloaded/i,
+];
+
+class QuotaError extends Error {
+  constructor(message, partialOutput) {
+    super(message);
+    this.name = 'QuotaError';
+    this.partialOutput = partialOutput;
+  }
+}
+
+function isQuotaError(stderr) {
+  return QUOTA_PATTERNS.some((p) => p.test(stderr));
+}
 
 // ── Fixed agent roster ─────────────────────────────────────────────────────
 // The orchestrator MUST pick from these names. Anything else gets a fallback.
@@ -47,7 +70,7 @@ export const executionService = {
     const job = await executionQueue.add(
       'run-execution',
       { executionId: execution._id.toString() },
-      { attempts: 3, backoff: { type: 'exponential', delay: 5000 } }
+      { attempts: 3, backoff: { type: 'exponential', delay: 5000 }, removeOnFail: false }
     );
 
     await executionRepository.updateStatus(execution._id, 'queued', { jobId: job.id });
@@ -69,6 +92,27 @@ export const executionService = {
 
   async getExecutionsByTask(taskId) {
     return executionRepository.findByTaskId(taskId);
+  },
+
+  async resumeExecution(executionId) {
+    const execution = await executionRepository.findByIdOrFail(executionId);
+    if (execution.status !== 'paused') {
+      throw Object.assign(new Error('Execution is not paused'), { statusCode: 400 });
+    }
+
+    const job = await executionQueue.add(
+      'run-execution',
+      { executionId: execution._id.toString() },
+      // No retries on resume — quota errors will pause again rather than loop
+      { attempts: 1, removeOnFail: false }
+    );
+
+    await executionRepository.updateStatus(executionId, 'queued', {
+      jobId: job.id,
+      pausedReason: null,
+    });
+
+    return execution;
   },
 
   /**
@@ -101,7 +145,25 @@ async function runOrchestration(executionId, execution) {
   const emit = makeEmitter(executionId);
 
   try {
-    await emit('info', 'Orchestration started');
+    // Resume path: if checkpoint has partial output, try to use it as the plan
+    if (execution.checkpoint?.partialOutput) {
+      await emit('info', 'Resuming orchestration from checkpoint …');
+      const resumed = await tryResumeFromPlan(
+        execution.taskId, task, execution.checkpoint.partialOutput, emit
+      );
+      if (resumed) {
+        await executionRepository.updateStatus(executionId, 'success', {
+          output: { text: execution.checkpoint.partialOutput },
+          finishedAt: new Date(),
+          checkpoint: null,
+          pausedReason: null,
+        });
+        return;
+      }
+      await emit('info', 'Checkpoint plan unparseable — re-running orchestrator');
+    } else {
+      await emit('info', 'Orchestration started');
+    }
 
     const output = await runClaudeCli({
       agent,
@@ -117,6 +179,8 @@ async function runOrchestration(executionId, execution) {
     await executionRepository.updateStatus(executionId, 'success', {
       output: { text: output },
       finishedAt: new Date(),
+      checkpoint: null,
+      pausedReason: null,
     });
 
     // Parse the plan and schedule specialist executions
@@ -128,9 +192,40 @@ async function runOrchestration(executionId, execution) {
     }
   } catch (err) {
     await emit('error', err.message, { stack: err.stack });
+
+    if (err instanceof QuotaError) {
+      await executionRepository.updateStatus(executionId, 'paused', {
+        finishedAt: new Date(),
+        checkpoint: { partialOutput: err.partialOutput },
+        pausedReason: err.message,
+      });
+      // UnrecoverableError prevents BullMQ from auto-retrying
+      throw new UnrecoverableError(err.message);
+    }
+
     await executionRepository.updateStatus(executionId, 'error', { finishedAt: new Date() });
     await taskRepository.updateStatus(execution.taskId, 'failed');
     throw err;
+  }
+}
+
+/**
+ * Tries to schedule specialists using a saved partial output.
+ * Returns true if scheduling succeeded (plan was valid), false otherwise.
+ */
+async function tryResumeFromPlan(taskId, task, partialOutput, emit) {
+  try {
+    const jsonStr = partialOutput.replace(/^```json\s*/m, '').replace(/```\s*$/m, '').trim();
+    const plan = JSON.parse(jsonStr);
+    if (!Array.isArray(plan.agents) || plan.agents.length === 0) return false;
+
+    const scheduled = await scheduleSpecialists(taskId, task, partialOutput, emit);
+    if (scheduled === 0) {
+      await taskRepository.updateStatus(taskId, 'review');
+    }
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -149,11 +244,20 @@ async function runImplementation(executionId, execution) {
   const emit = makeEmitter(executionId);
 
   try {
-    // Checkout the repo so claude has a real working directory
-    const repo = pickRepo(project, agent);
-    await emit('info', `Checking out ${repo.name} @ ${repo.branch || 'main'} …`);
-    const cwd = await ensureCheckout({ slug: project.slug, repository: repo });
-    await emit('info', `Repo ready at ${cwd}`);
+    let cwd;
+
+    if (execution.checkpoint?.cwd) {
+      // Resume: reuse the existing workspace without resetting it.
+      // The partial file changes from the interrupted run are preserved there.
+      cwd = execution.checkpoint.cwd;
+      await emit('info', `Resuming implementation in existing workspace at ${cwd}`);
+    } else {
+      // Fresh start: clone / pull to a clean state
+      const repo = pickRepo(project, agent);
+      await emit('info', `Checking out ${repo.name} @ ${repo.branch || 'main'} …`);
+      cwd = await ensureCheckout({ slug: project.slug, repository: repo });
+      await emit('info', `Repo ready at ${cwd}`);
+    }
 
     await emit('info', 'Implementation started');
 
@@ -170,12 +274,35 @@ async function runImplementation(executionId, execution) {
     await executionRepository.updateStatus(executionId, 'success', {
       output: { text: output },
       finishedAt: new Date(),
+      checkpoint: null,
+      pausedReason: null,
     });
 
     // Check if all sibling implement-executions for this task are done
     await maybeCompleteTask(execution.taskId);
   } catch (err) {
     await emit('error', err.message, { stack: err.stack });
+
+    if (err instanceof QuotaError) {
+      // Determine the workspace path so resume knows not to reset it
+      let savedCwd = execution.checkpoint?.cwd || null;
+      if (!savedCwd) {
+        try {
+          const repo = pickRepo(project, agent);
+          const { getWorkspaceDir } = await import('../../infrastructure/git/checkout.service.js');
+          const path = await import('path');
+          savedCwd = path.default.join(getWorkspaceDir(project.slug), repo.name);
+        } catch { /* best-effort */ }
+      }
+
+      await executionRepository.updateStatus(executionId, 'paused', {
+        finishedAt: new Date(),
+        checkpoint: { partialOutput: err.partialOutput, cwd: savedCwd },
+        pausedReason: err.message,
+      });
+      throw new UnrecoverableError(err.message);
+    }
+
     await executionRepository.updateStatus(executionId, 'error', { finishedAt: new Date() });
     await taskRepository.updateStatus(execution.taskId, 'failed');
     throw err;
@@ -384,6 +511,13 @@ function runClaudeCli({ agent, task, input, emit, cwd, agentic }) {
       }
 
       if (code !== 0) {
+        const partialOutput = outputChunks.join('');
+        if (isQuotaError(stderrBuf)) {
+          return reject(new QuotaError(
+            `claude quota/rate-limit error (exit ${code}): ${stderrBuf.trim()}`,
+            partialOutput
+          ));
+        }
         return reject(
           new Error(`claude exited with code ${code}${stderrBuf ? `: ${stderrBuf.trim()}` : ''}`)
         );

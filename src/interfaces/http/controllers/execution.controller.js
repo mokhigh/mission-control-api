@@ -12,6 +12,11 @@ export const getExecutionsByTask = asyncHandler(async (req, res) => {
   res.json({ data: executions });
 });
 
+export const resumeExecution = asyncHandler(async (req, res) => {
+  const execution = await executionService.resumeExecution(req.params.id);
+  res.status(202).json({ data: execution });
+});
+
 /**
  * SSE endpoint — streams live logs for an execution.
  * GET /executions/:id/logs/stream

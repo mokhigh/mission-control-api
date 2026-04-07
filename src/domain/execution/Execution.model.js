@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 
-const STATUSES = ['queued', 'running', 'success', 'error'];
+const STATUSES = ['queued', 'running', 'success', 'error', 'paused'];
 
 const executionSchema = new mongoose.Schema(
   {
@@ -13,6 +13,8 @@ const executionSchema = new mongoose.Schema(
     startedAt: { type: Date, default: null },
     finishedAt: { type: Date, default: null },
     jobId: { type: String, default: null }, // BullMQ job id
+    checkpoint: { type: mongoose.Schema.Types.Mixed, default: null },
+    pausedReason: { type: String, default: null },
   },
   { timestamps: true }
 );
