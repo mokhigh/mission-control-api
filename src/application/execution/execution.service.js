@@ -349,9 +349,8 @@ async function scheduleSpecialists(taskId, task, rawOutput, emit) {
       agentId: agent._id,
       phase: 'implement',
       input: {
-        orchestratorPlan: plan,
         assignedAgent: entry,
-        steps: plan.steps || [],
+        steps: entry.steps?.length ? entry.steps : (plan.steps || []),
       },
     });
 
