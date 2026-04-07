@@ -228,6 +228,8 @@ async function scheduleSpecialists(taskId, task, rawOutput, emit) {
       },
     });
 
+    await taskRepository.update(taskId, { $addToSet: { assignedAgents: agent._id } });
+
     await emit('info', `Scheduled "${rosterName}" agent (requested: "${requestedName}")`);
     scheduled++;
   }
