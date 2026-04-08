@@ -1,8 +1,9 @@
 import { taskRepository } from '../../domain/task/task.repository.js';
 import { projectRepository } from '../../domain/project/project.repository.js';
 import { executionService } from '../execution/execution.service.js';
-import { NotFoundError, ValidationError } from '../../shared/errors/AppError.js';
+import { NotFoundError } from '../../shared/errors/AppError.js';
 import { logger } from '../../infrastructure/logger.js';
+import { sseHub } from '../../infrastructure/realtime/sse.js';
 
 export const taskService = {
   async createTask(data) {
@@ -10,6 +11,8 @@ export const taskService = {
     if (!project) throw new NotFoundError('Project');
 
     const task = await taskRepository.create(data);
+
+    sseHub.publishGlobal('task.created', task);
 
     // Trigger the orchestrator to build execution pipeline (non-blocking)
     executionService.scheduleOrchestratorForTask(task._id.toString()).catch((err) =>
@@ -32,6 +35,7 @@ export const taskService = {
   async updateStatus(id, status) {
     const task = await taskRepository.updateStatus(id, status);
     if (!task) throw new NotFoundError('Task');
+    sseHub.publishGlobal('task.updated', task);
     return task;
   },
 };

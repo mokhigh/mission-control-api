@@ -7,7 +7,7 @@
  *   3. Pushes to origin
  *   4. Returns the commit hash and a diff summary
  */
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { logger } from '../logger.js';
 
 /**
@@ -72,6 +72,61 @@ export function buildBranchName(taskId, title) {
     .slice(0, 50);
   const shortId = taskId.slice(-6);
   return `feat/${slug}-${shortId}`;
+}
+
+/**
+ * Uses Claude to generate a concise branch name and commit subject from a task title/description.
+ * Falls back to buildBranchName on error.
+ *
+ * @param {string} taskId
+ * @param {string} title
+ * @param {string} [description]
+ * @returns {Promise<{ branchName: string, commitSubject: string }>}
+ */
+export async function generateGitMeta(taskId, title, description) {
+  const descPart = description ? `\nDescription: ${description.slice(0, 300)}` : '';
+  const prompt =
+    `Generate a concise git branch slug and commit subject for this task.\n` +
+    `Title: ${title}${descPart}\n\n` +
+    `Rules:\n` +
+    `- branchSlug: 3-5 words, lowercase, hyphen-separated, verb-noun style, no prefix (e.g. "add-oauth2-auth", "fix-login-redirect")\n` +
+    `- commitSubject: conventional commits style, imperative mood, max 60 chars, no period (e.g. "feat: add OAuth2 authentication")\n\n` +
+    `Respond with ONLY valid JSON, no markdown:\n{"branchSlug":"...","commitSubject":"..."}`;
+
+  try {
+    const raw = await new Promise((resolve, reject) => {
+      const child = spawn('claude', ['-p', prompt, '--model', 'claude-haiku-4-5-20251001'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: process.env,
+      });
+      const chunks = [];
+      child.stdout.on('data', (d) => chunks.push(d.toString()));
+      child.on('close', (code) => {
+        if (code === 0) resolve(chunks.join('').trim());
+        else reject(new Error(`claude exited ${code}`));
+      });
+      child.on('error', reject);
+    });
+
+    const json = JSON.parse(raw.replace(/```(?:json)?\n?|```\n?/g, '').trim());
+    const safeSlug = json.branchSlug
+      .toLowerCase()
+      .replace(/[^a-z0-9-]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 50);
+    const shortId = taskId.slice(-6);
+
+    return {
+      branchName: `feat/${safeSlug}-${shortId}`,
+      commitSubject: json.commitSubject,
+    };
+  } catch (err) {
+    logger.warn('[git-branch] generateGitMeta failed, falling back', { err: err.message });
+    return {
+      branchName: buildBranchName(taskId, title),
+      commitSubject: `feat: ${title.slice(0, 60)}`,
+    };
+  }
 }
 
 // ── diff parser ────────────────────────────────────────────────────────────

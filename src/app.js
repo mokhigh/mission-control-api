@@ -11,6 +11,7 @@ import agentRoutes from './interfaces/http/routes/agent.routes.js';
 import executionRoutes from './interfaces/http/routes/execution.routes.js';
 import logRoutes from './interfaces/http/routes/log.routes.js';
 import deploymentRoutes from './interfaces/http/routes/deployment.routes.js';
+import eventsRoutes from './interfaces/http/routes/events.routes.js';
 
 const app = express();
 
@@ -28,6 +29,7 @@ app.use('/agents', agentRoutes);
 app.use('/executions', executionRoutes);
 app.use('/logs', logRoutes);
 app.use('/deployments', deploymentRoutes);
+app.use('/events', eventsRoutes);
 
 app.use(errorHandler);
 

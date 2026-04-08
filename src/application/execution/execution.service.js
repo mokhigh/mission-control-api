@@ -30,7 +30,7 @@ import { projectRepository } from '../../domain/project/project.repository.js';
 import { deploymentRepository } from '../../domain/deployment/deployment.repository.js';
 import { executionQueue } from '../../infrastructure/queue/bullmq.js';
 import { sseHub } from '../../infrastructure/realtime/sse.js';
-import { commitAndPush, buildBranchName } from '../../infrastructure/git/branch.service.js';
+import { commitAndPush, buildBranchName, generateGitMeta } from '../../infrastructure/git/branch.service.js';
 import { ensureCheckout } from '../../infrastructure/git/checkout.service.js';
 import { logger } from '../../infrastructure/logger.js';
 
@@ -140,7 +140,7 @@ async function runOrchestration(executionId, execution) {
   ]);
 
   await executionRepository.updateStatus(executionId, 'running', { startedAt: new Date() });
-  await taskRepository.updateStatus(execution.taskId, 'running');
+  await updateAndBroadcastTaskStatus(execution.taskId, 'running');
 
   const emit = makeEmitter(executionId);
 
@@ -188,7 +188,7 @@ async function runOrchestration(executionId, execution) {
 
     if (scheduled === 0) {
       // No specialists needed / parseable — move straight to review
-      await taskRepository.updateStatus(execution.taskId, 'review');
+      await updateAndBroadcastTaskStatus(execution.taskId, 'review');
     }
   } catch (err) {
     await emit('error', err.message, { stack: err.stack });
@@ -204,7 +204,7 @@ async function runOrchestration(executionId, execution) {
     }
 
     await executionRepository.updateStatus(executionId, 'error', { finishedAt: new Date() });
-    await taskRepository.updateStatus(execution.taskId, 'failed');
+    await updateAndBroadcastTaskStatus(execution.taskId, 'failed');
     throw err;
   }
 }
@@ -221,7 +221,7 @@ async function tryResumeFromPlan(taskId, task, partialOutput, emit) {
 
     const scheduled = await scheduleSpecialists(taskId, task, partialOutput, emit);
     if (scheduled === 0) {
-      await taskRepository.updateStatus(taskId, 'review');
+      await updateAndBroadcastTaskStatus(taskId, 'review');
     }
     return true;
   } catch {
@@ -311,7 +311,7 @@ async function runImplementation(executionId, execution) {
     }
 
     await executionRepository.updateStatus(executionId, 'error', { finishedAt: new Date() });
-    await taskRepository.updateStatus(execution.taskId, 'failed');
+    await updateAndBroadcastTaskStatus(execution.taskId, 'failed');
     throw err;
   }
 }
@@ -387,7 +387,7 @@ async function maybeCompleteTask(taskId) {
 
   const anyError = implementations.some((e) => e.status === 'error');
   if (anyError) {
-    await taskRepository.updateStatus(taskId, 'failed');
+    await updateAndBroadcastTaskStatus(taskId, 'failed');
     return;
   }
 
@@ -404,8 +404,8 @@ async function maybeCompleteTask(taskId) {
     const path = await import('path');
     const { access } = await import('fs/promises');
 
-    const branchName = buildBranchName(taskId.toString(), task.title);
-    const commitMessage = `feat: ${task.title}\n\nTask: ${taskId}\nSource: ${task.source?.provider || 'manual'}`;
+    const { branchName, commitSubject } = await generateGitMeta(taskId.toString(), task.title, task.description);
+    const commitMessage = `${commitSubject}\n\nTask: ${taskId}\nSource: ${task.source?.provider || 'manual'}`;
 
     for (const repo of repos) {
       const repoDir = path.default.join(getWorkspaceDir(project.slug), repo.name);
@@ -444,7 +444,7 @@ async function maybeCompleteTask(taskId) {
     if (repoResults.length > 0) {
       // Create a deployment record with per-repo results so the ApprovalPanel appears
       const lastResult = repoResults[repoResults.length - 1];
-      await deploymentRepository.create({
+      const deployment = await deploymentRepository.create({
         projectId: task.projectId,
         taskId,
         status: 'pending',
@@ -454,17 +454,18 @@ async function maybeCompleteTask(taskId) {
         commitHash: lastResult?.commitHash || '',
         diffSummary: lastResult?.diffSummary || '',
       });
+      sseHub.publishGlobal('deployment.created', deployment);
       await emit('info', 'Deployment created — awaiting approval');
     } else {
       await emit('warn', 'No repo changes detected — skipping deployment creation');
     }
 
-    await taskRepository.updateStatus(taskId, 'review');
+    await updateAndBroadcastTaskStatus(taskId, 'review');
   } catch (err) {
     logger.error('[maybeCompleteTask] branch/deployment creation failed', { taskId, err });
     await emit('warn', `Branch creation failed: ${err.message}`);
     // Still move to review even if branch creation fails
-    await taskRepository.updateStatus(taskId, 'review');
+    await updateAndBroadcastTaskStatus(taskId, 'review');
   }
 }
 
@@ -503,6 +504,12 @@ function pickRepo(project, agent, task) {
 }
 
 // ── Shared helpers ─────────────────────────────────────────────────────────
+
+async function updateAndBroadcastTaskStatus(taskId, status) {
+  const task = await taskRepository.updateStatus(taskId, status);
+  if (task) sseHub.publishGlobal('task.updated', task);
+  return task;
+}
 
 function makeEmitter(executionId) {
   return async (level, message, meta = {}) => {

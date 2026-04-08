@@ -2,6 +2,7 @@ import { deploymentRepository } from '../../domain/deployment/deployment.reposit
 import { taskRepository } from '../../domain/task/task.repository.js';
 import { NotFoundError, ValidationError } from '../../shared/errors/AppError.js';
 import { completeCard } from '../../infrastructure/trello/trello.client.js';
+import { sseHub } from '../../infrastructure/realtime/sse.js';
 
 export const deploymentService = {
   async listDeployments(filter = {}) {
@@ -25,8 +26,11 @@ export const deploymentService = {
       approvedAt: new Date(),
     });
 
+    sseHub.publishGlobal('deployment.updated', updated);
+
     // Move the task to approved
     const task = await taskRepository.updateStatus(deployment.taskId, 'approved');
+    if (task) sseHub.publishGlobal('task.updated', task);
 
     // Move the Trello card to the finished list (non-blocking)
     if (task?.source?.cardId && task?.source?.finishedListId) {
@@ -50,8 +54,11 @@ export const deploymentService = {
       rejectionReason: reason || null,
     });
 
+    sseHub.publishGlobal('deployment.updated', updated);
+
     // Move the task back to failed
-    await taskRepository.updateStatus(deployment.taskId, 'failed');
+    const rejectedTask = await taskRepository.updateStatus(deployment.taskId, 'failed');
+    if (rejectedTask) sseHub.publishGlobal('task.updated', rejectedTask);
 
     return updated;
   },
