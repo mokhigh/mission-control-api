@@ -252,8 +252,15 @@ async function runImplementation(executionId, execution) {
       cwd = execution.checkpoint.cwd;
       await emit('info', `Resuming implementation in existing workspace at ${cwd}`);
     } else {
-      // Fresh start: clone / pull to a clean state
-      const repo = pickRepo(project, agent);
+      // Fresh start: pick repo using explicit targeting or heuristic
+      const targetRepoName = execution.input?.assignedAgent?.targetRepo;
+      let repo;
+      if (targetRepoName) {
+        repo = (project?.repositories || []).find((r) => r.name === targetRepoName);
+        if (!repo) repo = pickRepo(project, agent, task);
+      } else {
+        repo = pickRepo(project, agent, task);
+      }
       await emit('info', `Checking out ${repo.name} @ ${repo.branch || 'main'} …`);
       cwd = await ensureCheckout({ slug: project.slug, repository: repo });
       await emit('info', `Repo ready at ${cwd}`);
@@ -288,7 +295,7 @@ async function runImplementation(executionId, execution) {
       let savedCwd = execution.checkpoint?.cwd || null;
       if (!savedCwd) {
         try {
-          const repo = pickRepo(project, agent);
+          const repo = pickRepo(project, agent, task);
           const { getWorkspaceDir } = await import('../../infrastructure/git/checkout.service.js');
           const path = await import('path');
           savedCwd = path.default.join(getWorkspaceDir(project.slug), repo.name);
@@ -349,7 +356,10 @@ async function scheduleSpecialists(taskId, task, rawOutput, emit) {
       agentId: agent._id,
       phase: 'implement',
       input: {
-        assignedAgent: entry,
+        assignedAgent: {
+          ...entry,
+          targetRepo: entry.targetRepo || null, // explicit repo from orchestrator plan
+        },
         steps: entry.steps?.length ? entry.steps : (plan.steps || []),
       },
     });
@@ -387,40 +397,68 @@ async function maybeCompleteTask(taskId) {
   const emit = makeEmitter(implementations[0]._id.toString());
 
   try {
-    // Commit changes in each repo that has modifications
+    // Commit changes only in repos that were actually checked out to disk
     const repos = project?.repositories || [];
-    let lastResult = null;
+    const repoResults = [];
+    const { getWorkspaceDir } = await import('../../infrastructure/git/checkout.service.js');
+    const path = await import('path');
+    const { access } = await import('fs/promises');
+
+    const branchName = buildBranchName(taskId.toString(), task.title);
+    const commitMessage = `feat: ${task.title}\n\nTask: ${taskId}\nSource: ${task.source?.provider || 'manual'}`;
 
     for (const repo of repos) {
-      const { ensureCheckout: _, getWorkspaceDir } = await import('../../infrastructure/git/checkout.service.js');
-      const path = await import('path');
       const repoDir = path.default.join(getWorkspaceDir(project.slug), repo.name);
 
-      const branchName = buildBranchName(taskId.toString(), task.title);
-      const commitMessage = `feat: ${task.title}\n\nTask: ${taskId}\nSource: ${task.source?.provider || 'manual'}`;
+      // Skip repos that were never checked out (e.g. frontend-only task in a multirepo)
+      try { await access(repoDir); } catch {
+        logger.info(`[maybeCompleteTask] skipping ${repo.name} — workspace not found`, { repoDir });
+        continue;
+      }
 
-      const result = await commitAndPush({ cwd: repoDir, branchName, commitMessage });
+      try {
+        const result = await commitAndPush({ cwd: repoDir, branchName, commitMessage });
 
-      if (result.commitHash) {
-        await emit('info', `Branch "${branchName}" created with commit ${result.commitHash.slice(0, 8)}`);
-        if (result.pushed) {
-          await emit('info', `Pushed to origin/${branchName}`);
+        if (result.commitHash) {
+          await emit('info', `Branch "${branchName}" created with commit ${result.commitHash.slice(0, 8)} in ${repo.name}`);
+          if (result.pushed) {
+            await emit('info', `Pushed to origin/${branchName} (${repo.name})`);
+          }
+          repoResults.push({
+            repoName: repo.name,
+            commitHash: result.commitHash,
+            diffSummary: result.diffSummary || '',
+            branch: branchName,
+            files: result.files || [],
+          });
         }
-        lastResult = { ...result, branchName };
+      } catch (repoErr) {
+        logger.error(`[maybeCompleteTask] branch creation failed for ${repo.name}`, { taskId, err: repoErr });
+        await emit('warn', `Branch creation failed for ${repo.name}: ${repoErr.message}`);
       }
     }
 
-    // Create a deployment record so the ApprovalPanel appears
-    await deploymentRepository.create({
-      projectId: task.projectId,
-      taskId,
-      status: 'pending',
-      environment: 'dev',
-      commitHash: lastResult?.commitHash || '',
-      diffSummary: lastResult?.diffSummary || '',
-    });
+    // Merge all per-repo file diffs into a flat list for the deployment record
+    const allFiles = repoResults.flatMap((rr) => rr.files || []);
 
-    await emit('info', 'Deployment created — awaiting approval');
+    if (repoResults.length > 0) {
+      // Create a deployment record with per-repo results so the ApprovalPanel appears
+      const lastResult = repoResults[repoResults.length - 1];
+      await deploymentRepository.create({
+        projectId: task.projectId,
+        taskId,
+        status: 'pending',
+        environment: 'dev',
+        repoResults,
+        files: allFiles,
+        commitHash: lastResult?.commitHash || '',
+        diffSummary: lastResult?.diffSummary || '',
+      });
+      await emit('info', 'Deployment created — awaiting approval');
+    } else {
+      await emit('warn', 'No repo changes detected — skipping deployment creation');
+    }
+
     await taskRepository.updateStatus(taskId, 'review');
   } catch (err) {
     logger.error('[maybeCompleteTask] branch/deployment creation failed', { taskId, err });
@@ -432,22 +470,36 @@ async function maybeCompleteTask(taskId) {
 
 // ── Repo picker ────────────────────────────────────────────────────────────
 
-function pickRepo(project, agent) {
+function pickRepo(project, agent, task) {
   const repos = project?.repositories || [];
   if (repos.length === 0) {
     throw new Error(`Project "${project.slug}" has no repositories configured`);
   }
-  // If the agent type hints at which repo, try to match by name
+
+  // 1. Explicit targeting: if task has targetRepos, narrow the set
+  const targetNames = task?.targetRepos?.length ? task.targetRepos : [];
+  const candidates = targetNames.length
+    ? repos.filter((r) => targetNames.includes(r.name))
+    : repos;
+
+  if (candidates.length === 0) {
+    throw new Error(`No matching repos for targetRepos [${targetNames.join(', ')}] in project "${project.slug}"`);
+  }
+
+  // 2. Execution-level input may specify a repo name from the plan
+  // (handled by caller passing input.assignedAgent.targetRepo)
+
+  // 3. Agent-type heuristic fallback
   if (agent?.type === 'frontend') {
-    const match = repos.find((r) => /dashboard|frontend|web|ui/i.test(r.name));
+    const match = candidates.find((r) => /dashboard|frontend|web|ui/i.test(r.name));
     if (match) return match;
   }
   if (agent?.type === 'backend') {
-    const match = repos.find((r) => /api|backend|server/i.test(r.name));
+    const match = candidates.find((r) => /api|backend|server/i.test(r.name));
     if (match) return match;
   }
-  // Default: first repo
-  return repos[0];
+  // Default: first candidate
+  return candidates[0];
 }
 
 // ── Shared helpers ─────────────────────────────────────────────────────────

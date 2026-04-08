@@ -21,17 +21,19 @@ export async function commitAndPush({ cwd, branchName, commitMessage }) {
   const status = await git(cwd, ['status', '--porcelain']);
   if (!status.trim()) {
     logger.info('[git-branch] no changes to commit', { cwd });
-    return { commitHash: null, diffSummary: '', pushed: false };
+    return { commitHash: null, diffSummary: '', files: [], pushed: false };
   }
 
   // Create and switch to feature branch
   await git(cwd, ['checkout', '-b', branchName]);
 
-  // Generate diff summary before committing
-  const diffSummary = await git(cwd, ['diff', '--stat']);
-
-  // Stage all changes
+  // Stage all changes first so diff --cached picks up new files
   await git(cwd, ['add', '-A']);
+
+  // Generate diff summary and structured diff from the staged changes
+  const diffSummary = await git(cwd, ['diff', '--cached', '--stat']);
+  const rawDiff = await git(cwd, ['diff', '--cached']);
+  const files = parseUnifiedDiff(rawDiff);
 
   // Commit
   await git(cwd, ['commit', '-m', commitMessage]);
@@ -43,7 +45,7 @@ export async function commitAndPush({ cwd, branchName, commitMessage }) {
   try {
     await git(cwd, ['push', '-u', 'origin', branchName]);
     logger.info('[git-branch] pushed branch', { branchName, commitHash });
-    return { commitHash, diffSummary, pushed: true };
+    return { commitHash, diffSummary, files, pushed: true };
   } catch (err) {
     // Push may fail if no remote is configured or no credentials — still return commit info
     logger.warn('[git-branch] push failed (changes are committed locally)', {
@@ -51,7 +53,7 @@ export async function commitAndPush({ cwd, branchName, commitMessage }) {
       commitHash,
       error: err.message,
     });
-    return { commitHash, diffSummary, pushed: false };
+    return { commitHash, diffSummary, files, pushed: false };
   }
 }
 
@@ -70,6 +72,58 @@ export function buildBranchName(taskId, title) {
     .slice(0, 50);
   const shortId = taskId.slice(-6);
   return `feat/${slug}-${shortId}`;
+}
+
+// ── diff parser ────────────────────────────────────────────────────────────
+
+/**
+ * Parses a unified diff string into a structured array of file objects
+ * compatible with the DiffViewer component.
+ */
+export function parseUnifiedDiff(raw) {
+  if (!raw || !raw.trim()) return [];
+
+  const files = [];
+  // Split on "diff --git" boundaries
+  const fileParts = raw.split(/^diff --git /m).filter(Boolean);
+
+  for (const part of fileParts) {
+    const lines = part.split('\n');
+
+    // Extract file path from "a/path b/path" header
+    const headerMatch = lines[0]?.match(/a\/(.+?)\s+b\/(.+)/);
+    const filePath = headerMatch ? headerMatch[2] : 'unknown';
+
+    let additions = 0;
+    let deletions = 0;
+    const hunks = [];
+    let currentHunk = null;
+
+    for (const line of lines) {
+      // Hunk header
+      if (line.startsWith('@@')) {
+        currentHunk = { header: line, lines: [] };
+        hunks.push(currentHunk);
+        continue;
+      }
+
+      if (!currentHunk) continue;
+
+      if (line.startsWith('+') && !line.startsWith('+++')) {
+        additions++;
+        currentHunk.lines.push({ type: 'add', content: line.slice(1) });
+      } else if (line.startsWith('-') && !line.startsWith('---')) {
+        deletions++;
+        currentHunk.lines.push({ type: 'remove', content: line.slice(1) });
+      } else if (line.startsWith(' ') || line === '') {
+        currentHunk.lines.push({ type: 'context', content: line.startsWith(' ') ? line.slice(1) : line });
+      }
+    }
+
+    files.push({ path: filePath, additions, deletions, hunks });
+  }
+
+  return files;
 }
 
 // ── helper ─────────────────────────────────────────────────────────────────

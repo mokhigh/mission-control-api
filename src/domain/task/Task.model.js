@@ -5,6 +5,7 @@ const STATUSES = ['pending', 'running', 'review', 'approved', 'deployed', 'faile
 const taskSchema = new mongoose.Schema(
   {
     projectId: { type: mongoose.Schema.Types.ObjectId, ref: 'Project', required: true },
+    targetRepos: { type: [String], default: [] }, // repo names within the project; empty = all repos
     title: { type: String, required: true, trim: true },
     description: { type: String, default: '' },
     source: {
